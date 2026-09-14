@@ -17,7 +17,7 @@ npm run dev
 npm run build
 ```
 
-Den færdige statiske app ligger i `dist/` og kan hostes på en almindelig statisk webhost. Appen bruger kun browserens `localStorage` til at holde styr på, hvilke indbyggede kort der allerede er brugt. Runden og eventuelt egen indtastning gemmes ikke.
+Den færdige statiske app ligger i `dist/` og kan hostes på en almindelig statisk webhost. Appen bruger browserens `localStorage` til at gemme egne kort og holde styr på, hvilke kort der allerede er brugt. Kortene findes kun i den browser, hvor de blev oprettet. Enkeltstående egne runder og igangværende runder gemmes ikke.
 
 ## Regler
 
@@ -27,3 +27,4 @@ Den færdige statiske app ligger i `dist/` og kan hostes på en almindelig stati
 - Gruppen vælger samlet lige så mange mistænkte, som der er impostere. De gode vinder kun, hvis alle impostere er udpeget.
 - Når alle stemmer er valgt, erstatter et klik på en anden spiller det ældste valg.
 - Ved egne kort er den, der skriver kortet, spilleder og deltager ikke i den runde.
+- Vælg **Blandet** under Indhold for at gemme egne ord eller spørgsmålspar og trække dem sammen med de indbyggede kort. Kort gentages først, når den valgte bunke er brugt op.

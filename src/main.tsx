@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { questionCards, wordCards, type QuestionCard, type WordCard } from './content'
+import { loadQuestionCards, loadWordCards, nextCard, saveQuestionCards, saveWordCards } from './cards'
 import './style.css'
 
 type Mode = 'word' | 'question'
 type Phase = 'setup' | 'handoff' | 'private' | 'discuss' | 'vote' | 'result'
-type ContentSource = 'built-in' | 'custom'
+type ContentSource = 'built-in' | 'mixed' | 'custom'
 type HintMode = 'always' | 'starter' | 'never'
 type Round = {
   mode: Mode
@@ -35,20 +36,6 @@ function randomIndexes(total: number, count: number) {
   return picked
 }
 
-function nextCard<T>(mode: Mode, cards: T[]): T {
-  const key = `imposter-used-${mode}`
-  let used: number[] = []
-  try {
-    const stored = JSON.parse(localStorage.getItem(key) || '[]')
-    if (Array.isArray(stored)) used = stored.filter((value): value is number => Number.isInteger(value) && value >= 0 && value < cards.length)
-  } catch { /* Ignore old or invalid browser data. */ }
-  const remaining = cards.map((_, index) => index).filter(index => !used.includes(index))
-  const pool = remaining.length ? remaining : cards.map((_, index) => index)
-  const index = pool[randomInt(pool.length)]
-  try { localStorage.setItem(key, JSON.stringify([...(!remaining.length ? [] : used), index])) } catch { /* Private browsing may disable storage. */ }
-  return cards[index]
-}
-
 function App() {
   const [mode, setMode] = useState<Mode>('word')
   const [phase, setPhase] = useState<Phase>('setup')
@@ -61,6 +48,8 @@ function App() {
   const [customHint, setCustomHint] = useState('')
   const [customReal, setCustomReal] = useState('')
   const [customAlternate, setCustomAlternate] = useState('')
+  const [ownWords, setOwnWords] = useState(loadWordCards)
+  const [ownQuestions, setOwnQuestions] = useState(loadQuestionCards)
   const [round, setRound] = useState<Round | null>(null)
   const [turn, setTurn] = useState(0)
   const [answer, setAnswer] = useState('')
@@ -94,8 +83,8 @@ function App() {
       if (mode === 'question' && customReal.trim().toLocaleLowerCase('da') === customAlternate.trim().toLocaleLowerCase('da')) return setError('De to spørgsmål skal være forskellige.')
     }
     const card = mode === 'word'
-      ? source === 'custom' ? { word: customWord.trim(), hint: customHint.trim() } : nextCard('word', wordCards)
-      : source === 'custom' ? { real: customReal.trim(), alternate: customAlternate.trim() } : nextCard('question', questionCards)
+      ? source === 'custom' ? { word: customWord.trim(), hint: customHint.trim() } : nextCard('word', wordCards, ownWords, source === 'mixed')
+      : source === 'custom' ? { real: customReal.trim(), alternate: customAlternate.trim() } : nextCard('question', questionCards, ownQuestions, source === 'mixed')
     setRound({ mode, players: [...players], imposters: randomIndexes(players.length, effectiveCount), starter: randomInt(players.length), card, hintMode, answers: Array(players.length).fill('') })
     setTurn(0)
     setAnswer('')
@@ -126,7 +115,7 @@ function App() {
     setAnswer('')
     setSelected([])
     setError('')
-    setSource('built-in')
+    setSource(source === 'custom' ? 'built-in' : source)
     setCustomWord('')
     setCustomHint('')
     setCustomReal('')
@@ -138,6 +127,45 @@ function App() {
   function toggleVote(index: number) {
     if (!round) return
     setSelected(current => current.includes(index) ? current.filter(value => value !== index) : current.length < round.imposters.length ? [...current, index] : [...current.slice(1), index])
+  }
+
+  function addOwnCard() {
+    if (mode === 'word') {
+      const word = customWord.trim()
+      const hint = customHint.trim()
+      if (!word || !hint) return setError('Skriv både ord og hint for at gemme kortet. Hintet bruges, hvis hint er slået til i runden.')
+      if ([...wordCards, ...ownWords].some(card => card.word.toLocaleLowerCase('da') === word.toLocaleLowerCase('da'))) return setError('Ordet findes allerede i kortbunken.')
+      const updated = [...ownWords, { id: crypto.randomUUID(), word, hint }]
+      if (!saveWordCards(updated)) return setError('Kortet kunne ikke gemmes på denne enhed. Kontrollér browserens lagerindstillinger.')
+      setOwnWords(updated)
+      setCustomWord('')
+      setCustomHint('')
+    } else {
+      const real = customReal.trim()
+      const alternate = customAlternate.trim()
+      if (!real || !alternate) return setError('Skriv begge spørgsmål for at gemme kortet.')
+      if (real.toLocaleLowerCase('da') === alternate.toLocaleLowerCase('da')) return setError('De to spørgsmål skal være forskellige.')
+      if ([...questionCards, ...ownQuestions].some(card => card.real.toLocaleLowerCase('da') === real.toLocaleLowerCase('da'))) return setError('Spørgsmålet findes allerede i kortbunken.')
+      const updated = [...ownQuestions, { id: crypto.randomUUID(), real, alternate }]
+      if (!saveQuestionCards(updated)) return setError('Kortet kunne ikke gemmes på denne enhed. Kontrollér browserens lagerindstillinger.')
+      setOwnQuestions(updated)
+      setCustomReal('')
+      setCustomAlternate('')
+    }
+    setError('')
+  }
+
+  function removeOwnCard(id: string) {
+    if (mode === 'word') {
+      const updated = ownWords.filter(card => card.id !== id)
+      if (!saveWordCards(updated)) return setError('Kortet kunne ikke fjernes fra denne enhed.')
+      setOwnWords(updated)
+    } else {
+      const updated = ownQuestions.filter(card => card.id !== id)
+      if (!saveQuestionCards(updated)) return setError('Kortet kunne ikke fjernes fra denne enhed.')
+      setOwnQuestions(updated)
+    }
+    setError('')
   }
 
   return <div className="app-shell">
@@ -180,7 +208,8 @@ function App() {
           <div className="section-heading"><span className="step">03</span><div><h2>Indstil runden</h2><p>Vælg antal impostere og indhold.</p></div></div>
           <div className="setting-row"><div><strong>Antal impostere</strong><small>To impostere er muligt fra 6 spillere.</small></div><div className="segmented"><button className={effectiveCount === 1 ? 'selected' : ''} onClick={() => setImposterCount(1)} aria-pressed={effectiveCount === 1}>1</button><button className={effectiveCount === 2 ? 'selected' : ''} onClick={() => setImposterCount(2)} disabled={players.length < 6} aria-pressed={effectiveCount === 2}>2</button></div></div>
           {mode === 'word' && <div className="setting-row"><div><strong>Hvad ser imposteren?</strong><small>Vælg om og hvornår imposteren får et hint.</small></div><div className="segmented hint-options"><button className={hintMode === 'always' ? 'selected' : ''} onClick={() => setHintMode('always')} aria-pressed={hintMode === 'always'}>Hint</button><button className={hintMode === 'starter' ? 'selected' : ''} onClick={() => setHintMode('starter')} aria-pressed={hintMode === 'starter'}>Hint hvis imposter starter</button><button className={hintMode === 'never' ? 'selected' : ''} onClick={() => setHintMode('never')} aria-pressed={hintMode === 'never'}>Intet</button></div></div>}
-          <div className="setting-row"><div><strong>Indhold</strong><small>Brug danske kort eller skriv jeres eget.</small></div><div className="segmented"><button className={source === 'built-in' ? 'selected' : ''} onClick={() => { setSource('built-in'); setError('') }} aria-pressed={source === 'built-in'}>Kort</button><button className={source === 'custom' ? 'selected' : ''} onClick={() => { setSource('custom'); setError('') }} aria-pressed={source === 'custom'}>Eget</button></div></div>
+          <div className="setting-row"><div><strong>Indhold</strong><small>Vælg indbyggede kort, en blandet bunke eller ét eget kort.</small></div><div className="segmented"><button className={source === 'built-in' ? 'selected' : ''} onClick={() => { setSource('built-in'); setError('') }} aria-pressed={source === 'built-in'}>Kort</button><button className={source === 'mixed' ? 'selected' : ''} onClick={() => { setSource('mixed'); setError('') }} aria-pressed={source === 'mixed'}>Blandet</button><button className={source === 'custom' ? 'selected' : ''} onClick={() => { setSource('custom'); setError('') }} aria-pressed={source === 'custom'}>Én egen runde</button></div></div>
+          {source === 'mixed' && <div className="custom-fields"><p className="notice">Egne kort gemmes kun i denne browser og blandes med de indbyggede. Hvis en spiller selv har skrevet et kort, kan vedkommende genkende det.</p><div className="saved-card-heading"><strong>Egne {mode === 'word' ? 'ord' : 'spørgsmål'} ({mode === 'word' ? ownWords.length : ownQuestions.length})</strong></div>{mode === 'word' ? <><label>Tilføj ord<input value={customWord} onChange={event => setCustomWord(event.target.value)} placeholder="F.eks. Strand" maxLength={60} /></label><label>Hint til imposter<input value={customHint} onChange={event => setCustomHint(event.target.value)} placeholder="F.eks. Sommer" maxLength={60} /></label></> : <><label>Det rigtige spørgsmål<textarea value={customReal} onChange={event => setCustomReal(event.target.value)} placeholder="Spørgsmål til de gode" maxLength={240} /></label><label>Imposterens spørgsmål<textarea value={customAlternate} onChange={event => setCustomAlternate(event.target.value)} placeholder="Et andet, men beslægtet spørgsmål" maxLength={240} /></label></>}<button className="add-button save-card-button" onClick={addOwnCard}>+ Gem i kortbunken</button><div className="saved-card-list">{(mode === 'word' ? ownWords : ownQuestions).map(card => <div className="saved-card" key={card.id}><span>{'word' in card ? card.word : card.real}</span><button aria-label={`Fjern kort: ${'word' in card ? card.word : card.real}`} onClick={() => removeOwnCard(card.id)}>×</button></div>)}</div></div>}
           {source === 'custom' && <div className="custom-fields"><p className="notice">Den, der skriver kortet, er spilleder og skal ikke stå på spillerlisten i denne runde.</p>{mode === 'word' ? <><label>Det rigtige ord<input value={customWord} onChange={event => setCustomWord(event.target.value)} placeholder="F.eks. Strand" maxLength={60} /></label>{hintMode !== 'never' && <label>Hint til imposter<input value={customHint} onChange={event => setCustomHint(event.target.value)} placeholder="F.eks. Sommer" maxLength={60} /></label>}</> : <><label>Det rigtige spørgsmål<textarea value={customReal} onChange={event => setCustomReal(event.target.value)} placeholder="Spørgsmål til de gode" maxLength={240} /></label><label>Imposterens spørgsmål<textarea value={customAlternate} onChange={event => setCustomAlternate(event.target.value)} placeholder="Et andet, men beslægtet spørgsmål" maxLength={240} /></label></>}</div>}
         </section>
         {error && <p className="error" role="alert">{error}</p>}
