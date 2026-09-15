@@ -2,6 +2,7 @@ import { Redis } from '@upstash/redis'
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { questionCards, wordCards, type QuestionCard, type WordCard } from '../src/content'
 
+// Persistent room models. Tokens never leave the player-specific API response.
 type GameSettings = { mode: 'word' | 'question'; imposterCount: 1 | 2; hintMode: 'always' | 'starter' | 'never'; contentSource: 'built-in' | 'mixed'; turnTimeSeconds: 0 | 15 | 30 | 45 | 60 }
 type Player = { id: string; token: string; name: string; joinedAt: string; lastSeenAt: string }
 type Game = { imposters: string[]; starterId: string; card: WordCard | QuestionCard; readyIds: string[]; turnIndex: number; clues: Record<string, string>; answers: Record<string, string>; votes: Record<string, string>; deadline: number | null }
@@ -11,6 +12,7 @@ const ROOM_LIFETIME_SECONDS = 60 * 60 * 12
 const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 const DEFAULT_SETTINGS: GameSettings = { mode: 'word', imposterCount: 1, hintMode: 'always', contentSource: 'built-in', turnTimeSeconds: 30 }
 
+// Single Vercel Function entry point for room reads and commands.
 export default async function handler(request: VercelRequest, response: VercelResponse) {
   try {
     if (request.method === 'GET') return getRoom(request, response)
@@ -51,6 +53,7 @@ async function updateRoom(request: VercelRequest, response: VercelResponse) {
   return json(response, { error: 'Ukendt handling.' }, 400)
 }
 
+// Lobby lifecycle: create, join, leave, heartbeat and host settings.
 async function createRoom(playerName: string, response: VercelResponse) {
   const redis = getRedis()
   for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -144,6 +147,7 @@ async function updateSettings(body: Record<string, unknown>, response: VercelRes
   return json(response, { room: publicRoom(result.room), isHost: true })
 }
 
+// Authoritative online game state machine.
 async function startGame(body: Record<string, unknown>, response: VercelResponse) {
   return authenticatedMutation(body, response, true, room => {
     if (room.phase !== 'lobby') return { error: 'Spillet er allerede startet.', status: 409 }
@@ -212,6 +216,7 @@ async function resetGame(body: Record<string, unknown>, response: VercelResponse
   return authenticatedMutation(body, response, true, room => { room.phase = 'lobby'; delete room.game; return room })
 }
 
+// Authenticate once, run a state transition, then return only this player's view.
 async function authenticatedMutation(body: Record<string, unknown>, response: VercelResponse, hostOnly: boolean, mutation: (room: Room, player: Player) => Room | { error: string; status: number }) {
   const identity = readIdentity(body)
   if (!identity) return json(response, { error: 'Ugyldige spilleroplysninger.' }, 400)
@@ -228,12 +233,14 @@ async function authenticatedMutation(body: Record<string, unknown>, response: Ve
   return json(response, { room: publicRoom(result.room), game: playerGame(result.room, identity.playerId), isHost: result.room.hostId === identity.playerId })
 }
 
+// Turn-order and server-deadline helpers.
 function advanceExpiredTurn(room: Room) { if (room.phase === 'turns' && room.game?.deadline && Date.now() >= room.game.deadline) advanceTurn(room) }
 function advanceTurn(room: Room) { if (!room.game) return; room.game.turnIndex += 1; if (room.game.turnIndex >= room.players.length) { room.phase = 'discussion'; room.game.deadline = null } else setDeadline(room) }
 function setDeadline(room: Room) { if (room.game) room.game.deadline = room.settings.turnTimeSeconds ? Date.now() + room.settings.turnTimeSeconds * 1000 : null }
 function shuffled<T>(values: T[]) { const copy = [...values]; for (let index = copy.length - 1; index > 0; index -= 1) { const other = randomIndex(index + 1); [copy[index], copy[other]] = [copy[other], copy[index]] } return copy }
 function randomIndex(max: number) { const value = new Uint32Array(1); crypto.getRandomValues(value); return value[0] % max }
 
+// Serialize concurrent joins, leaves and moves so Redis updates cannot overwrite each other.
 async function mutateRoom<T extends { room: Room; deleteRoom?: boolean }>(code: string, mutation: (room: Room) => T | { error: string; status: number }): Promise<T | { error: string; status: number }> {
   const redis = getRedis()
   const lockKey = `lock:${roomKey(code)}`
@@ -259,6 +266,7 @@ async function mutateRoom<T extends { room: Room; deleteRoom?: boolean }>(code: 
   }
 }
 
+// Shape public room data separately from private, player-specific game data.
 function playerResponse(room: Room, player: Player, isHost: boolean) { return { room: publicRoom(room), playerId: player.id, playerToken: player.token, isHost } }
 function publicRoom(room: Room) { return { code: room.code, phase: room.phase, hostId: room.hostId, settings: room.settings ?? DEFAULT_SETTINGS, createdAt: room.createdAt, updatedAt: room.updatedAt, players: room.players.map(({ id, name }) => ({ id, name })) } }
 function playerGame(room: Room, playerId: string) {
@@ -292,6 +300,7 @@ function playerGame(room: Room, playerId: string) {
 function authenticatedPlayer(room: Room, identity: { playerId: string; playerToken: string }) { return room.players.find(player => player.id === identity.playerId && player.token === identity.playerToken) }
 function readIdentity(body: Record<string, unknown>) { const code = normalizeCode(body.code); const playerId = typeof body.playerId === 'string' ? body.playerId : ''; const playerToken = typeof body.playerToken === 'string' ? body.playerToken : ''; return code && playerId && playerToken ? { code, playerId, playerToken } : null }
 
+// Validate every value received from an untrusted browser client.
 function normalizeSettings(value: unknown): GameSettings | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
   const settings = value as Partial<GameSettings>
@@ -306,6 +315,7 @@ function normalizePlayerName(value: unknown) { if (typeof value !== 'string') re
 function readBody(value: unknown): Record<string, unknown> | null { try { const parsed: unknown = typeof value === 'string' ? JSON.parse(value) : value; return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null } catch { return null } }
 function roomKey(code: string) { return `room:${code}` }
 
+// Lazily initialize Redis so builds do not require runtime credentials.
 let redisClient: Redis | null = null
 function getRedis() {
   if (redisClient) return redisClient

@@ -6,6 +6,7 @@ export type SavedQuestionCard = QuestionCard & { id: string }
 const wordKey = 'imposter-own-words'
 const questionKey = 'imposter-own-questions'
 
+// Safely restore user-created cards from this browser only.
 function readCards<T>(key: string, valid: (value: unknown) => value is T): T[] {
   try {
     const value = JSON.parse(localStorage.getItem(key) || '[]')
@@ -31,6 +32,7 @@ export function saveQuestionCards(cards: SavedQuestionCard[]): boolean {
   try { localStorage.setItem(questionKey, JSON.stringify(cards)); return true } catch { return false }
 }
 
+// Draw without repeats until the selected deck has completed a full cycle.
 export function nextCard<T>(mode: 'word' | 'question', builtIn: T[], own: (T & { id: string })[], mixed: boolean): T {
   const cards = [
     ...builtIn.map((card, index) => ({ key: `b:${index}`, card })),

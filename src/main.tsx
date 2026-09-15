@@ -4,6 +4,7 @@ import { questionCards, wordCards, type QuestionCard, type WordCard } from './co
 import { loadQuestionCards, loadWordCards, nextCard, saveQuestionCards, saveWordCards } from './cards'
 import './style.css'
 
+// Shared client-side models for the local and online game flows.
 type Mode = 'word' | 'question'
 type Phase = 'setup' | 'handoff' | 'private' | 'discuss' | 'vote' | 'result'
 type ContentSource = 'built-in' | 'mixed' | 'custom'
@@ -30,6 +31,7 @@ type Round = {
   answers: string[]
 }
 
+// Cryptographically random helpers used for local role assignment.
 function randomInt(max: number) {
   if (window.crypto?.getRandomValues) {
     const value = new Uint32Array(1)
@@ -49,6 +51,7 @@ function randomIndexes(total: number, count: number) {
 }
 
 function App() {
+  // Navigation and online lobby session.
   const [playLocation, setPlayLocation] = useState<PlayLocation>('choose')
   const [onlineView, setOnlineView] = useState<OnlineView>('menu')
   const [onlineName, setOnlineName] = useState('')
@@ -63,6 +66,7 @@ function App() {
   const [onlineIsHost, setOnlineIsHost] = useState(false)
   const [onlineBusy, setOnlineBusy] = useState(false)
   const [copied, setCopied] = useState(false)
+  // Local-game setup and round state.
   const [mode, setMode] = useState<Mode>('word')
   const [phase, setPhase] = useState<Phase>('setup')
   const [players, setPlayers] = useState<string[]>([])
@@ -91,6 +95,7 @@ function App() {
   const questionCard = round?.mode === 'question' ? round.card as QuestionCard : null
   const allFound = round !== null && selected.length === round.imposters.length && selected.every(index => round.imposters.includes(index))
 
+  // Keep each online client synchronized and authenticated with the room.
   const onlineRoomCode = onlineRoom?.code
   useEffect(() => {
     if (!onlineRoomCode) return
@@ -126,6 +131,7 @@ function App() {
     return () => window.removeEventListener('beforeunload', leaveOnClose)
   }, [onlineRoomCode, onlinePlayerId, onlinePlayerToken])
 
+  // Online lobby commands.
   async function submitOnline(action: 'create' | 'join') {
     const playerName = onlineName.trim().replace(/\s+/g, ' ')
     const code = onlineCode.trim().toUpperCase()
@@ -217,6 +223,7 @@ function App() {
     window.setTimeout(() => setCopied(false), 1800)
   }
 
+  // Local-game commands.
   function addPlayer() {
     const trimmed = name.trim().replace(/\s+/g, ' ')
     if (!trimmed) return setError('Skriv et navn først.')
@@ -450,6 +457,7 @@ function App() {
   </div>
 }
 
+// Renders every server-controlled phase after the host starts an online round.
 type OnlineGameScreenProps = { room: OnlineRoom; game: OnlineGame; playerId: string; isHost: boolean; text: string; setText: (value: string) => void; vote: string; setVote: (value: string) => void; clock: number; busy: boolean; error: string; action: (action: 'start' | 'ready' | 'submit' | 'advance' | 'vote' | 'reset', extras?: Record<string, unknown>) => Promise<void>; leave: () => void }
 
 function OnlineGameScreen({ room, game, playerId, isHost, text, setText, vote, setVote, clock, busy, error, action, leave }: OnlineGameScreenProps) {
