@@ -1,15 +1,13 @@
-type Player = { id: string; name: string; joinedAt: string }
-type Room = {
-  code: string
-  phase: 'lobby'
-  createdAt: string
-  updatedAt: string
-  hostId: string
-  players: Player[]
-}
+import { Redis } from '@upstash/redis'
+import type { VercelRequest, VercelResponse } from '@vercel/node'
+
+type GameSettings = { mode: 'word' | 'question'; imposterCount: 1 | 2; hintMode: 'always' | 'starter' | 'never'; contentSource: 'built-in' | 'mixed' }
+type Player = { id: string; token: string; name: string; joinedAt: string; lastSeenAt: string }
+type Room = { code: string; phase: 'lobby'; createdAt: string; updatedAt: string; hostId: string; players: Player[]; settings: GameSettings }
 
 const ROOM_LIFETIME_SECONDS = 60 * 60 * 12
 const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const DEFAULT_SETTINGS: GameSettings = { mode: 'word', imposterCount: 1, hintMode: 'always', contentSource: 'built-in' }
 
 export default async function handler(request: VercelRequest, response: VercelResponse) {
   try {
@@ -25,8 +23,7 @@ export default async function handler(request: VercelRequest, response: VercelRe
 async function getRoom(request: VercelRequest, response: VercelResponse) {
   const code = normalizeCode(Array.isArray(request.query.code) ? request.query.code[0] : request.query.code)
   if (!code) return json(response, { error: 'Angiv en gyldig rumkode.' }, 400)
-
-  const room = await redisGet<Room>(roomKey(code))
+  const room = await getRedis().get<Room>(roomKey(code))
   if (!room) return json(response, { error: 'Rummet findes ikke eller er udløbet.' }, 404)
   return json(response, { room: publicRoom(room) })
 }
@@ -34,126 +31,147 @@ async function getRoom(request: VercelRequest, response: VercelResponse) {
 async function updateRoom(request: VercelRequest, response: VercelResponse) {
   const body = readBody(request.body)
   if (!body) return json(response, { error: 'Ugyldig JSON.' }, 400)
-
   const action = typeof body.action === 'string' ? body.action : ''
-  const playerName = normalizePlayerName(body.playerName)
-  if (!playerName) return json(response, { error: 'Spillernavnet skal være mellem 1 og 24 tegn.' }, 400)
-
-  if (action === 'create') return createRoom(playerName, response)
-  if (action === 'join') return joinRoom(body.code, playerName, response)
-  return json(response, { error: 'Handlingen skal være create eller join.' }, 400)
+  if (action === 'create' || action === 'join') {
+    const playerName = normalizePlayerName(body.playerName)
+    if (!playerName) return json(response, { error: 'Spillernavnet skal være mellem 1 og 24 tegn.' }, 400)
+    return action === 'create' ? createRoom(playerName, response) : joinRoom(body.code, playerName, response)
+  }
+  if (action === 'leave') return leaveRoom(body, response)
+  if (action === 'heartbeat') return heartbeat(body, response)
+  if (action === 'settings') return updateSettings(body, response)
+  return json(response, { error: 'Ukendt handling.' }, 400)
 }
 
 async function createRoom(playerName: string, response: VercelResponse) {
+  const redis = getRedis()
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const code = createCode()
-    if (await redisGet<Room>(roomKey(code))) continue
-
+    if (await redis.exists(roomKey(code))) continue
     const now = new Date().toISOString()
     const host = createPlayer(playerName, now)
-    const room: Room = { code, phase: 'lobby', createdAt: now, updatedAt: now, hostId: host.id, players: [host] }
-    await redisSet(roomKey(code), room)
-    return json(response, { room: publicRoom(room), playerId: host.id, isHost: true }, 201)
+    const room: Room = { code, phase: 'lobby', createdAt: now, updatedAt: now, hostId: host.id, players: [host], settings: DEFAULT_SETTINGS }
+    const created = await redis.set(roomKey(code), room, { nx: true, ex: ROOM_LIFETIME_SECONDS })
+    if (created) return json(response, playerResponse(room, host, true), 201)
   }
-
   return json(response, { error: 'Kunne ikke oprette en unik rumkode. Prøv igen.' }, 503)
 }
 
 async function joinRoom(rawCode: unknown, playerName: string, response: VercelResponse) {
   const code = normalizeCode(rawCode)
   if (!code) return json(response, { error: 'Angiv en gyldig rumkode.' }, 400)
+  const result = await mutateRoom<{ room: Room; player: Player }>(code, room => {
+    if (room.phase !== 'lobby') return { error: 'Spillet er allerede startet.', status: 409 }
+    if (room.players.length >= 20) return { error: 'Rummet er fyldt.', status: 409 }
+    if (room.players.some(player => player.name.toLocaleLowerCase('da') === playerName.toLocaleLowerCase('da'))) return { error: 'Navnet er allerede taget i rummet.', status: 409 }
+    const now = new Date().toISOString()
+    const player = createPlayer(playerName, now)
+    room.players.push(player)
+    room.updatedAt = now
+    return { room, player }
+  })
+  if ('error' in result) return json(response, { error: result.error }, result.status)
+  return json(response, playerResponse(result.room, result.player, false), 201)
+}
 
-  const room = await redisGet<Room>(roomKey(code))
-  if (!room) return json(response, { error: 'Rummet findes ikke eller er udløbet.' }, 404)
-  if (room.phase !== 'lobby') return json(response, { error: 'Spillet er allerede startet.' }, 409)
-  if (room.players.length >= 20) return json(response, { error: 'Rummet er fyldt.' }, 409)
-  if (room.players.some(player => player.name.toLocaleLowerCase('da') === playerName.toLocaleLowerCase('da'))) {
-    return json(response, { error: 'Navnet er allerede taget i rummet.' }, 409)
+async function leaveRoom(body: Record<string, unknown>, response: VercelResponse) {
+  const identity = readIdentity(body)
+  if (!identity) return json(response, { error: 'Ugyldige spilleroplysninger.' }, 400)
+  const result = await mutateRoom(identity.code, room => {
+    const player = authenticatedPlayer(room, identity)
+    if (!player) return { error: 'Spilleren findes ikke i rummet.', status: 403 }
+    room.players = room.players.filter(item => item.id !== player.id)
+    room.updatedAt = new Date().toISOString()
+    if (room.players.length && room.hostId === player.id) room.hostId = room.players[0].id
+    if (room.players.length < 6) room.settings.imposterCount = 1
+    return { room, deleteRoom: room.players.length === 0 }
+  })
+  if ('error' in result) return json(response, { error: result.error }, result.status)
+  return json(response, { ok: true })
+}
+
+async function heartbeat(body: Record<string, unknown>, response: VercelResponse) {
+  const identity = readIdentity(body)
+  if (!identity) return json(response, { error: 'Ugyldige spilleroplysninger.' }, 400)
+  const result = await mutateRoom(identity.code, room => {
+    const player = authenticatedPlayer(room, identity)
+    if (!player) return { error: 'Spilleren findes ikke i rummet.', status: 403 }
+    player.lastSeenAt = new Date().toISOString()
+    return { room, player }
+  })
+  if ('error' in result) return json(response, { error: result.error }, result.status)
+  return json(response, { room: publicRoom(result.room), isHost: result.room.hostId === identity.playerId })
+}
+
+async function updateSettings(body: Record<string, unknown>, response: VercelResponse) {
+  const identity = readIdentity(body)
+  const settings = normalizeSettings(body.settings)
+  if (!identity || !settings) return json(response, { error: 'Ugyldige indstillinger.' }, 400)
+  const result = await mutateRoom(identity.code, room => {
+    const player = authenticatedPlayer(room, identity)
+    if (!player) return { error: 'Spilleren findes ikke i rummet.', status: 403 }
+    if (room.hostId !== player.id) return { error: 'Kun værten kan ændre indstillingerne.', status: 403 }
+    if (settings.imposterCount === 2 && room.players.length < 6) return { error: 'I skal være mindst 6 spillere for at vælge 2 impostere.', status: 409 }
+    room.settings = settings
+    room.updatedAt = new Date().toISOString()
+    return { room, player }
+  })
+  if ('error' in result) return json(response, { error: result.error }, result.status)
+  return json(response, { room: publicRoom(result.room), isHost: true })
+}
+
+async function mutateRoom<T extends { room: Room; deleteRoom?: boolean }>(code: string, mutation: (room: Room) => T | { error: string; status: number }): Promise<T | { error: string; status: number }> {
+  const redis = getRedis()
+  const lockKey = `lock:${roomKey(code)}`
+  const lockToken = crypto.randomUUID()
+  let acquired = false
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    acquired = Boolean(await redis.set(lockKey, lockToken, { nx: true, px: 3000 }))
+    if (acquired) break
+    await new Promise(resolve => setTimeout(resolve, 45 * (attempt + 1)))
   }
-
-  const now = new Date().toISOString()
-  const player = createPlayer(playerName, now)
-  room.players.push(player)
-  room.updatedAt = now
-  await redisSet(roomKey(code), room)
-  return json(response, { room: publicRoom(room), playerId: player.id, isHost: false }, 201)
-}
-
-function publicRoom(room: Room) {
-  return {
-    code: room.code,
-    phase: room.phase,
-    createdAt: room.createdAt,
-    updatedAt: room.updatedAt,
-    players: room.players.map(({ id, name }) => ({ id, name })),
-  }
-}
-
-function createPlayer(name: string, joinedAt: string): Player {
-  return { id: crypto.randomUUID(), name, joinedAt }
-}
-
-function createCode() {
-  const bytes = crypto.getRandomValues(new Uint8Array(4))
-  return Array.from(bytes, byte => ROOM_CODE_CHARS[byte % ROOM_CODE_CHARS.length]).join('')
-}
-
-function normalizeCode(value: unknown) {
-  if (typeof value !== 'string') return ''
-  const code = value.trim().toUpperCase()
-  return /^[A-Z2-9]{4}$/.test(code) ? code : ''
-}
-
-function normalizePlayerName(value: unknown) {
-  if (typeof value !== 'string') return ''
-  const name = value.trim().replace(/\s+/g, ' ')
-  return name.length >= 1 && name.length <= 24 ? name : ''
-}
-
-function readBody(value: unknown): Record<string, unknown> | null {
+  if (!acquired) return { error: 'Rummet er optaget. Prøv igen.', status: 409 }
   try {
-    const parsed: unknown = typeof value === 'string' ? JSON.parse(value) : value
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
-  } catch {
-    return null
+    const room = await redis.get<Room>(roomKey(code))
+    if (!room) return { error: 'Rummet findes ikke eller er udløbet.', status: 404 }
+    room.settings ??= DEFAULT_SETTINGS
+    const result = mutation(room)
+    if ('error' in result) return result
+    if (result.deleteRoom) await redis.del(roomKey(code))
+    else await redis.set(roomKey(code), room, { ex: ROOM_LIFETIME_SECONDS })
+    return result
+  } finally {
+    await redis.eval('if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end', [lockKey], [lockToken])
   }
 }
 
-function roomKey(code: string) {
-  return `room:${code}`
+function playerResponse(room: Room, player: Player, isHost: boolean) { return { room: publicRoom(room), playerId: player.id, playerToken: player.token, isHost } }
+function publicRoom(room: Room) { return { code: room.code, phase: room.phase, hostId: room.hostId, settings: room.settings ?? DEFAULT_SETTINGS, createdAt: room.createdAt, updatedAt: room.updatedAt, players: room.players.map(({ id, name }) => ({ id, name })) } }
+function authenticatedPlayer(room: Room, identity: { playerId: string; playerToken: string }) { return room.players.find(player => player.id === identity.playerId && player.token === identity.playerToken) }
+function readIdentity(body: Record<string, unknown>) { const code = normalizeCode(body.code); const playerId = typeof body.playerId === 'string' ? body.playerId : ''; const playerToken = typeof body.playerToken === 'string' ? body.playerToken : ''; return code && playerId && playerToken ? { code, playerId, playerToken } : null }
+
+function normalizeSettings(value: unknown): GameSettings | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const settings = value as Partial<GameSettings>
+  if (!['word', 'question'].includes(settings.mode ?? '') || (settings.imposterCount !== 1 && settings.imposterCount !== 2) || !['always', 'starter', 'never'].includes(settings.hintMode ?? '') || !['built-in', 'mixed'].includes(settings.contentSource ?? '')) return null
+  return settings as GameSettings
 }
 
-function redisConfig() {
+function createPlayer(name: string, now: string): Player { return { id: crypto.randomUUID(), token: crypto.randomUUID(), name, joinedAt: now, lastSeenAt: now } }
+function createCode() { const bytes = crypto.getRandomValues(new Uint8Array(4)); return Array.from(bytes, byte => ROOM_CODE_CHARS[byte % ROOM_CODE_CHARS.length]).join('') }
+function normalizeCode(value: unknown) { if (typeof value !== 'string') return ''; const code = value.trim().toUpperCase(); return /^[A-Z2-9]{4}$/.test(code) ? code : '' }
+function normalizePlayerName(value: unknown) { if (typeof value !== 'string') return ''; const name = value.trim().replace(/\s+/g, ' '); return name.length >= 1 && name.length <= 24 ? name : '' }
+function readBody(value: unknown): Record<string, unknown> | null { try { const parsed: unknown = typeof value === 'string' ? JSON.parse(value) : value; return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null } catch { return null } }
+function roomKey(code: string) { return `room:${code}` }
+
+let redisClient: Redis | null = null
+function getRedis() {
+  if (redisClient) return redisClient
   const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL
   const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN
   if (!url || !token) throw new Error('Redis is not configured')
-  return { url: url.replace(/\/$/, ''), token }
+  redisClient = new Redis({ url, token })
+  return redisClient
 }
 
-async function redisGet<T>(key: string): Promise<T | null> {
-  const result = await redisCommand<string | null>(['GET', key])
-  return result ? JSON.parse(result) as T : null
-}
-
-async function redisSet(key: string, value: unknown) {
-  await redisCommand(['SET', key, JSON.stringify(value), 'EX', String(ROOM_LIFETIME_SECONDS)])
-}
-
-async function redisCommand<T>(command: string[]): Promise<T> {
-  const { url, token } = redisConfig()
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(command),
-  })
-  const payload = await response.json() as { result?: T; error?: string }
-  if (!response.ok || payload.error) throw new Error(payload.error || `Redis returned ${response.status}`)
-  return payload.result as T
-}
-
-function json(response: VercelResponse, data: unknown, status = 200, headers: Record<string, string> = {}) {
-  response.setHeader('Cache-Control', 'no-store')
-  for (const [name, value] of Object.entries(headers)) response.setHeader(name, value)
-  return response.status(status).json(data)
-}
-import type { VercelRequest, VercelResponse } from '@vercel/node'
+function json(response: VercelResponse, data: unknown, status = 200, headers: Record<string, string> = {}) { response.setHeader('Cache-Control', 'no-store'); for (const [name, value] of Object.entries(headers)) response.setHeader(name, value); return response.status(status).json(data) }

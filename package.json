@@ -9,6 +9,7 @@
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

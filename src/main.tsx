@@ -10,12 +10,15 @@ type ContentSource = 'built-in' | 'mixed' | 'custom'
 type HintMode = 'always' | 'starter' | 'never'
 type PlayLocation = 'choose' | 'local' | 'online'
 type OnlineView = 'menu' | 'create' | 'join' | 'lobby'
+type OnlineSettings = { mode: Mode; imposterCount: 1 | 2; hintMode: HintMode; contentSource: 'built-in' | 'mixed' }
 type OnlineRoom = {
   code: string
   phase: 'lobby'
+  hostId: string
+  settings: OnlineSettings
   players: { id: string; name: string }[]
 }
-type RoomResponse = { room?: OnlineRoom; playerId?: string; isHost?: boolean; error?: string }
+type RoomResponse = { room?: OnlineRoom; playerId?: string; playerToken?: string; isHost?: boolean; error?: string }
 type Round = {
   mode: Mode
   players: string[]
@@ -51,6 +54,7 @@ function App() {
   const [onlineCode, setOnlineCode] = useState('')
   const [onlineRoom, setOnlineRoom] = useState<OnlineRoom | null>(null)
   const [onlinePlayerId, setOnlinePlayerId] = useState('')
+  const [onlinePlayerToken, setOnlinePlayerToken] = useState('')
   const [onlineIsHost, setOnlineIsHost] = useState(false)
   const [onlineBusy, setOnlineBusy] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -87,16 +91,28 @@ function App() {
     if (!onlineRoomCode) return
     const refreshRoom = async () => {
       try {
-        const response = await fetch(`/api/rooms?code=${onlineRoomCode}`, { cache: 'no-store' })
+        const response = onlinePlayerId && onlinePlayerToken
+          ? await fetch('/api/rooms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'heartbeat', code: onlineRoomCode, playerId: onlinePlayerId, playerToken: onlinePlayerToken }) })
+          : await fetch(`/api/rooms?code=${onlineRoomCode}`, { cache: 'no-store' })
         const data = await response.json() as RoomResponse
-        if (response.ok && data.room) setOnlineRoom(data.room)
+        if (response.ok && data.room) {
+          setOnlineRoom(data.room)
+          setOnlineIsHost(data.room.hostId === onlinePlayerId)
+        }
       } catch {
         // A kortvarig netværksfejl skal ikke smide spilleren ud af lobbyen.
       }
     }
-    const timer = window.setInterval(refreshRoom, 2000)
+    const timer = window.setInterval(refreshRoom, 3000)
     return () => window.clearInterval(timer)
-  }, [onlineRoomCode])
+  }, [onlineRoomCode, onlinePlayerId, onlinePlayerToken])
+
+  useEffect(() => {
+    if (!onlineRoomCode || !onlinePlayerId || !onlinePlayerToken) return
+    const leaveOnClose = () => navigator.sendBeacon('/api/rooms', JSON.stringify({ action: 'leave', code: onlineRoomCode, playerId: onlinePlayerId, playerToken: onlinePlayerToken }))
+    window.addEventListener('beforeunload', leaveOnClose)
+    return () => window.removeEventListener('beforeunload', leaveOnClose)
+  }, [onlineRoomCode, onlinePlayerId, onlinePlayerToken])
 
   async function submitOnline(action: 'create' | 'join') {
     const playerName = onlineName.trim().replace(/\s+/g, ' ')
@@ -113,9 +129,10 @@ function App() {
         body: JSON.stringify({ action, playerName, ...(action === 'join' ? { code } : {}) }),
       })
       const data = await response.json() as RoomResponse
-      if (!response.ok || !data.room || !data.playerId) throw new Error(data.error || 'Kunne ikke forbinde til rummet.')
+      if (!response.ok || !data.room || !data.playerId || !data.playerToken) throw new Error(data.error || 'Kunne ikke forbinde til rummet.')
       setOnlineRoom(data.room)
       setOnlinePlayerId(data.playerId)
+      setOnlinePlayerToken(data.playerToken)
       setOnlineIsHost(Boolean(data.isHost))
       setOnlineView('lobby')
     } catch (onlineError) {
@@ -125,17 +142,44 @@ function App() {
     }
   }
 
-  function leaveOnline() {
+  function clearOnline() {
     setOnlineRoom(null)
     setOnlinePlayerId('')
+    setOnlinePlayerToken('')
     setOnlineIsHost(false)
     setOnlineView('menu')
     setError('')
   }
 
+  async function leaveOnline() {
+    if (onlineRoom && onlinePlayerId && onlinePlayerToken) {
+      try {
+        await fetch('/api/rooms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'leave', code: onlineRoom.code, playerId: onlinePlayerId, playerToken: onlinePlayerToken }), keepalive: true })
+      } catch {
+        // Lobbyen forsvinder lokalt, selv hvis netværket afbrydes under udmeldingen.
+      }
+    }
+    clearOnline()
+  }
+
+  async function updateOnlineSettings(changes: Partial<OnlineSettings>) {
+    if (!onlineRoom || !onlineIsHost || !onlinePlayerToken) return
+    const settings = { ...onlineRoom.settings, ...changes }
+    setOnlineRoom({ ...onlineRoom, settings })
+    setError('')
+    try {
+      const response = await fetch('/api/rooms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'settings', code: onlineRoom.code, playerId: onlinePlayerId, playerToken: onlinePlayerToken, settings }) })
+      const data = await response.json() as RoomResponse
+      if (!response.ok || !data.room) throw new Error(data.error || 'Indstillingerne kunne ikke gemmes.')
+      setOnlineRoom(data.room)
+    } catch (settingsError) {
+      setError(settingsError instanceof Error ? settingsError.message : 'Indstillingerne kunne ikke gemmes.')
+    }
+  }
+
   function goHome() {
     if (phase !== 'setup') reset(false)
-    leaveOnline()
+    void leaveOnline()
     setPlayLocation('choose')
   }
 
@@ -303,12 +347,22 @@ function App() {
           <h1>Rummet er <em>klar.</em></h1>
           <p>Del koden med de andre spillere. Listen opdateres automatisk.</p>
           <button className="room-code-card" onClick={() => void copyRoomCode()} aria-label="Kopiér rumkode"><small>RUMKODE</small><strong>{onlineRoom.code}</strong><span>{copied ? 'Kopieret!' : 'Tryk for at kopiere'}</span></button>
+          <div className="lobby-layout">
           <div className="lobby-panel">
             <div className="lobby-heading"><div><strong>Spillere</strong><small>{onlineRoom.players.length} / 20 i lobbyen</small></div><span className="connection-state"><i /> LIVE</span></div>
-            <div className="lobby-players">{onlineRoom.players.map(player => <div className="lobby-player" key={player.id}><span className="avatar">{player.name.charAt(0).toLocaleUpperCase('da')}</span><strong>{player.name}</strong>{player.id === onlinePlayerId && <small>DIG</small>}</div>)}</div>
+            <div className="lobby-players">{onlineRoom.players.map(player => <div className="lobby-player" key={player.id}><span className="avatar">{player.name.charAt(0).toLocaleUpperCase('da')}</span><strong>{player.name}</strong>{player.id === onlineRoom.hostId && <small className="host-pill">VÆRT</small>}{player.id === onlinePlayerId && <small>DIG</small>}</div>)}</div>
           </div>
+          <div className="lobby-panel lobby-settings">
+            <div className="lobby-heading"><div><strong>Indstillinger</strong><small>{onlineIsHost ? 'Du kan ændre dem frem til spilstart.' : 'Kun værten kan ændre dem.'}</small></div></div>
+            <div className="setting-row"><div><strong>Spil</strong><small>Vælg typen af imposter-runde.</small></div><div className="segmented"><button className={onlineRoom.settings.mode === 'word' ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ mode: 'word' })}>Hemmelig ord</button><button className={onlineRoom.settings.mode === 'question' ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ mode: 'question' })}>Forkert spørgsmål</button></div></div>
+            <div className="setting-row"><div><strong>Antal impostere</strong><small>To kræver mindst 6 spillere.</small></div><div className="segmented"><button className={onlineRoom.settings.imposterCount === 1 ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ imposterCount: 1 })}>1</button><button className={onlineRoom.settings.imposterCount === 2 ? 'selected' : ''} disabled={!onlineIsHost || onlineRoom.players.length < 6} onClick={() => void updateOnlineSettings({ imposterCount: 2 })}>2</button></div></div>
+            {onlineRoom.settings.mode === 'word' && <div className="setting-row"><div><strong>Hvad ser imposteren?</strong><small>Vælg hvor meget hjælp imposteren får.</small></div><div className="segmented hint-options"><button className={onlineRoom.settings.hintMode === 'always' ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ hintMode: 'always' })}>Hint</button><button className={onlineRoom.settings.hintMode === 'starter' ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ hintMode: 'starter' })}>Kun hvis starter</button><button className={onlineRoom.settings.hintMode === 'never' ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ hintMode: 'never' })}>Intet</button></div></div>}
+            <div className="setting-row"><div><strong>Indhold</strong><small>Egne online-kort kommer i næste trin.</small></div><div className="segmented"><button className="selected" disabled>Indbyggede kort</button></div></div>
+          </div>
+          </div>
+          {error && <p className="error" role="alert">{error}</p>}
           {onlineIsHost ? <><button className="primary" disabled>Start spillet <span>→</span></button><p className="selection-count">Selve online-spilrunden bliver næste trin.</p></> : <p className="waiting-note"><span /> Venter på at værten starter spillet…</p>}
-          <button className="secondary" onClick={leaveOnline}>Forlad rummet</button>
+          <button className="secondary" onClick={() => void leaveOnline()}>Forlad rummet</button>
         </section>}
       </section>}
 
