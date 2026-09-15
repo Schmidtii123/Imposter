@@ -10,15 +10,16 @@ type ContentSource = 'built-in' | 'mixed' | 'custom'
 type HintMode = 'always' | 'starter' | 'never'
 type PlayLocation = 'choose' | 'local' | 'online'
 type OnlineView = 'menu' | 'create' | 'join' | 'lobby'
-type OnlineSettings = { mode: Mode; imposterCount: 1 | 2; hintMode: HintMode; contentSource: 'built-in' | 'mixed' }
+type OnlineSettings = { mode: Mode; imposterCount: 1 | 2; hintMode: HintMode; contentSource: 'built-in' | 'mixed'; turnTimeSeconds: 0 | 15 | 30 | 45 | 60 }
 type OnlineRoom = {
   code: string
-  phase: 'lobby'
+  phase: 'lobby' | 'reveal' | 'turns' | 'answering' | 'discussion' | 'vote' | 'result'
   hostId: string
   settings: OnlineSettings
   players: { id: string; name: string }[]
 }
-type RoomResponse = { room?: OnlineRoom; playerId?: string; playerToken?: string; isHost?: boolean; error?: string }
+type OnlineGame = { isImposter: boolean; secret: string | null; prompt: string | null; starterId: string; ready: boolean; readyCount: number; currentPlayerId: string | null; deadline: number | null; clues: Record<string, string>; submitted: boolean; answers: Record<string, string>; voted: boolean; votesCast: number; imposters: string[]; card: WordCard | QuestionCard | null; voteCounts: Record<string, number> }
+type RoomResponse = { room?: OnlineRoom; game?: OnlineGame; playerId?: string; playerToken?: string; isHost?: boolean; error?: string }
 type Round = {
   mode: Mode
   players: string[]
@@ -55,6 +56,10 @@ function App() {
   const [onlineRoom, setOnlineRoom] = useState<OnlineRoom | null>(null)
   const [onlinePlayerId, setOnlinePlayerId] = useState('')
   const [onlinePlayerToken, setOnlinePlayerToken] = useState('')
+  const [onlineGame, setOnlineGame] = useState<OnlineGame | null>(null)
+  const [onlineText, setOnlineText] = useState('')
+  const [onlineVote, setOnlineVote] = useState('')
+  const [clock, setClock] = useState(Date.now())
   const [onlineIsHost, setOnlineIsHost] = useState(false)
   const [onlineBusy, setOnlineBusy] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -97,6 +102,7 @@ function App() {
         const data = await response.json() as RoomResponse
         if (response.ok && data.room) {
           setOnlineRoom(data.room)
+          setOnlineGame(data.game ?? null)
           setOnlineIsHost(data.room.hostId === onlinePlayerId)
         }
       } catch {
@@ -106,6 +112,12 @@ function App() {
     const timer = window.setInterval(refreshRoom, 3000)
     return () => window.clearInterval(timer)
   }, [onlineRoomCode, onlinePlayerId, onlinePlayerToken])
+
+  useEffect(() => {
+    if (!onlineGame?.deadline) return
+    const timer = window.setInterval(() => setClock(Date.now()), 250)
+    return () => window.clearInterval(timer)
+  }, [onlineGame?.deadline])
 
   useEffect(() => {
     if (!onlineRoomCode || !onlinePlayerId || !onlinePlayerToken) return
@@ -146,6 +158,9 @@ function App() {
     setOnlineRoom(null)
     setOnlinePlayerId('')
     setOnlinePlayerToken('')
+    setOnlineGame(null)
+    setOnlineText('')
+    setOnlineVote('')
     setOnlineIsHost(false)
     setOnlineView('menu')
     setError('')
@@ -175,6 +190,18 @@ function App() {
     } catch (settingsError) {
       setError(settingsError instanceof Error ? settingsError.message : 'Indstillingerne kunne ikke gemmes.')
     }
+  }
+
+  async function onlineAction(action: 'start' | 'ready' | 'submit' | 'advance' | 'vote' | 'reset', extras: Record<string, unknown> = {}) {
+    if (!onlineRoom || !onlinePlayerToken) return
+    setOnlineBusy(true); setError('')
+    try {
+      const response = await fetch('/api/rooms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, code: onlineRoom.code, playerId: onlinePlayerId, playerToken: onlinePlayerToken, ...extras }) })
+      const data = await response.json() as RoomResponse
+      if (!response.ok || !data.room) throw new Error(data.error || 'Handlingen kunne ikke gennemføres.')
+      setOnlineRoom(data.room); setOnlineGame(data.game ?? null); setOnlineIsHost(Boolean(data.isHost)); setOnlineText('')
+    } catch (actionError) { setError(actionError instanceof Error ? actionError.message : 'Handlingen kunne ikke gennemføres.') }
+    finally { setOnlineBusy(false) }
   }
 
   function goHome() {
@@ -342,7 +369,7 @@ function App() {
             </form>
           </section>}
         </>}
-        {onlineView === 'lobby' && onlineRoom && <section className="game-screen online-lobby">
+        {onlineView === 'lobby' && onlineRoom?.phase === 'lobby' && <section className="game-screen online-lobby">
           <div className="eyebrow"><span className="live-dot" /> ONLINE LOBBY</div>
           <h1>Rummet er <em>klar.</em></h1>
           <p>Del koden med de andre spillere. Listen opdateres automatisk.</p>
@@ -357,13 +384,15 @@ function App() {
             <div className="setting-row"><div><strong>Spil</strong><small>Vælg typen af imposter-runde.</small></div><div className="segmented"><button className={onlineRoom.settings.mode === 'word' ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ mode: 'word' })}>Hemmelig ord</button><button className={onlineRoom.settings.mode === 'question' ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ mode: 'question' })}>Forkert spørgsmål</button></div></div>
             <div className="setting-row"><div><strong>Antal impostere</strong><small>To kræver mindst 6 spillere.</small></div><div className="segmented"><button className={onlineRoom.settings.imposterCount === 1 ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ imposterCount: 1 })}>1</button><button className={onlineRoom.settings.imposterCount === 2 ? 'selected' : ''} disabled={!onlineIsHost || onlineRoom.players.length < 6} onClick={() => void updateOnlineSettings({ imposterCount: 2 })}>2</button></div></div>
             {onlineRoom.settings.mode === 'word' && <div className="setting-row"><div><strong>Hvad ser imposteren?</strong><small>Vælg hvor meget hjælp imposteren får.</small></div><div className="segmented hint-options"><button className={onlineRoom.settings.hintMode === 'always' ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ hintMode: 'always' })}>Hint</button><button className={onlineRoom.settings.hintMode === 'starter' ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ hintMode: 'starter' })}>Kun hvis starter</button><button className={onlineRoom.settings.hintMode === 'never' ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ hintMode: 'never' })}>Intet</button></div></div>}
+            {onlineRoom.settings.mode === 'word' && <div className="setting-row"><div><strong>Tid til hint</strong><small>Hvor længe hver spiller må skrive.</small></div><div className="segmented timer-options">{([0, 15, 30, 45, 60] as const).map(seconds => <button key={seconds} className={onlineRoom.settings.turnTimeSeconds === seconds ? 'selected' : ''} disabled={!onlineIsHost} onClick={() => void updateOnlineSettings({ turnTimeSeconds: seconds })}>{seconds === 0 ? 'Ingen' : `${seconds}s`}</button>)}</div></div>}
             <div className="setting-row"><div><strong>Indhold</strong><small>Egne online-kort kommer i næste trin.</small></div><div className="segmented"><button className="selected" disabled>Indbyggede kort</button></div></div>
           </div>
           </div>
           {error && <p className="error" role="alert">{error}</p>}
-          {onlineIsHost ? <><button className="primary" disabled>Start spillet <span>→</span></button><p className="selection-count">Selve online-spilrunden bliver næste trin.</p></> : <p className="waiting-note"><span /> Venter på at værten starter spillet…</p>}
+          {onlineIsHost ? <><button className="primary" disabled={onlineRoom.players.length < 3 || onlineBusy} onClick={() => void onlineAction('start')}>Start spillet <span>→</span></button>{onlineRoom.players.length < 3 && <p className="selection-count">I skal være mindst 3 spillere.</p>}</> : <p className="waiting-note"><span /> Venter på at værten starter spillet…</p>}
           <button className="secondary" onClick={() => void leaveOnline()}>Forlad rummet</button>
         </section>}
+        {onlineView === 'lobby' && onlineRoom && onlineRoom.phase !== 'lobby' && onlineGame && <OnlineGameScreen room={onlineRoom} game={onlineGame} playerId={onlinePlayerId} isHost={onlineIsHost} text={onlineText} setText={setOnlineText} vote={onlineVote} setVote={setOnlineVote} clock={clock} busy={onlineBusy} error={error} action={onlineAction} leave={() => void leaveOnline()} />}
       </section>}
 
       {playLocation === 'local' && phase === 'setup' && <>
@@ -419,6 +448,28 @@ function App() {
       {phase === 'result' && round && <section className="game-screen result-screen"><div className="large-icon">{allFound ? '✦' : '◆'}</div><p className="eyebrow">RUNDEN ER SLUT</p><h1>{allFound ? <>De gode <em>vinder!</em></> : <>Imposteren{round.imposters.length === 2 ? 'e' : ''} <em>vinder!</em></>}</h1><p>{allFound ? 'I fandt alle imposterne.' : 'I fandt ikke alle imposterne.'}</p><div className="result-card"><small>IMPOSTER{round.imposters.length === 2 ? 'E' : ''}</small><div className="imposter-names">{round.imposters.map(index => <span key={index}>{round.players[index]}</span>)}</div><div className="result-divider" /><small>{round.mode === 'word' ? 'DET RIGTIGE ORD' : 'DET RIGTIGE SPØRGSMÅL'}</small><strong>{round.mode === 'word' ? wordCard?.word : questionCard?.real}</strong>{round.mode === 'word' && starterReceivesHint && <p>{round.hintMode === 'starter' ? `Hint til startspilleren ${round.players[round.starter]}` : 'Hint til imposter'}: {wordCard?.hint}</p>}{round.mode === 'question' && <p>Imposterens spørgsmål: {questionCard?.alternate}</p>}</div><div className="result-votes"><strong>Jeres valg</strong><span>{selected.map(index => round.players[index]).join(' & ')}</span></div><button className="primary" onClick={() => reset()}>Spil igen <span>→</span></button><button className="secondary" onClick={() => reset(false)}>Ny spillergruppe</button></section>}
     </main>
   </div>
+}
+
+type OnlineGameScreenProps = { room: OnlineRoom; game: OnlineGame; playerId: string; isHost: boolean; text: string; setText: (value: string) => void; vote: string; setVote: (value: string) => void; clock: number; busy: boolean; error: string; action: (action: 'start' | 'ready' | 'submit' | 'advance' | 'vote' | 'reset', extras?: Record<string, unknown>) => Promise<void>; leave: () => void }
+
+function OnlineGameScreen({ room, game, playerId, isHost, text, setText, vote, setVote, clock, busy, error, action, leave }: OnlineGameScreenProps) {
+  const playerName = (id: string | null) => room.players.find(player => player.id === id)?.name ?? 'Ukendt'
+  const secondsLeft = game.deadline ? Math.max(0, Math.ceil((game.deadline - clock) / 1000)) : null
+  const isMyTurn = room.phase === 'turns' && game.currentPlayerId === playerId
+  const wordCard = game.card && 'word' in game.card ? game.card : null
+  const questionCard = game.card && 'real' in game.card ? game.card : null
+
+  return <section className="game-screen online-game">
+    <div className="progress-label">RUM {room.code}<span>{room.players.length} SPILLERE</span></div>
+    {room.phase === 'reveal' && <><div className={`role-badge ${room.settings.mode === 'question' ? 'question' : game.isImposter ? 'imposter' : 'civilian'}`}>{room.settings.mode === 'question' ? 'DIT SPØRGSMÅL' : game.isImposter ? 'DU ER IMPOSTER' : 'DU ER USKYLDIG'}</div><h1>{room.settings.mode === 'word' ? game.secret ? 'Dit ord eller hint er' : 'Du får intet hint' : 'Dit spørgsmål er'}</h1>{(game.secret || game.prompt) && <div className={room.settings.mode === 'word' ? 'secret-card' : 'reveal-question'}><strong>{game.secret || game.prompt}</strong></div>}<p>Husk det, og vis ikke skærmen til de andre.</p><button className="primary" disabled={game.ready || busy} onClick={() => void action('ready')}>{game.ready ? `Venter på de andre (${game.readyCount}/${room.players.length})` : 'Jeg er klar'} <span>→</span></button></>}
+    {room.phase === 'turns' && <><p className="eyebrow">ÉT ORD AD GANGEN</p><h1>{isMyTurn ? <>Det er <em>din tur</em></> : <><em>{playerName(game.currentPlayerId)}</em> skriver</>}</h1>{secondsLeft !== null && <div className={`timer-ring ${secondsLeft <= 5 ? 'urgent' : ''}`}>{secondsLeft}</div>}<div className="online-clues">{room.players.map(player => <div key={player.id}><strong>{player.name}</strong><span>{game.clues[player.id] || (player.id === game.currentPlayerId ? 'skriver…' : '—')}</span></div>)}</div>{isMyTurn && <form className="turn-form" onSubmit={event => { event.preventDefault(); void action('submit', { text }) }}><input value={text} onChange={event => setText(event.target.value.replace(/\s/g, ''))} placeholder="Skriv ét ord" maxLength={30} autoFocus /><button className="primary" disabled={!text.trim() || busy}>Send hint <span>→</span></button></form>}</>}
+    {room.phase === 'answering' && <><p className="eyebrow">SVAR HEMMELIGT</p><h1>{game.submitted ? 'Dit svar er sendt' : game.prompt}</h1>{!game.submitted ? <form className="turn-form" onSubmit={event => { event.preventDefault(); void action('submit', { text }) }}><textarea className="answer-input" value={text} onChange={event => setText(event.target.value)} placeholder="Skriv dit svar…" maxLength={120} autoFocus /><button className="primary" disabled={!text.trim() || busy}>Send svar <span>→</span></button></form> : <p>Venter på de andre spillere…</p>}</>}
+    {room.phase === 'discussion' && <><p className="eyebrow">DISKUTÉR SVARENE</p><h1>Hvem virker <em>mistænkelig?</em></h1><div className="answers-list">{room.players.map(player => <div className="answer-item" key={player.id}><strong>{player.name}</strong><span>{room.settings.mode === 'word' ? game.clues[player.id] || 'Intet svar' : game.answers[player.id] || 'Intet svar'}</span></div>)}</div>{isHost ? <button className="primary" onClick={() => void action('advance')}>Start afstemning <span>→</span></button> : <p>Venter på at værten starter afstemningen…</p>}</>}
+    {room.phase === 'vote' && <><p className="eyebrow">AFSTEMNING</p><h1>Hvem er <em>imposter?</em></h1>{!game.voted ? <><div className="vote-grid">{room.players.filter(player => player.id !== playerId).map(player => <button className={`vote-option ${vote === player.id ? 'chosen' : ''}`} key={player.id} onClick={() => setVote(player.id)}><span className="avatar">{player.name[0]}</span><strong>{player.name}</strong><span className="vote-check">{vote === player.id ? '✓' : ''}</span></button>)}</div><button className="primary" disabled={!vote || busy} onClick={() => void action('vote', { targetId: vote })}>Afgiv stemme <span>→</span></button></> : <p>Din stemme er afgivet. Venter på de andre ({game.votesCast}/{room.players.length})…</p>}</>}
+    {room.phase === 'result' && <><p className="eyebrow">RESULTATET</p><h1>Imposteren var <em>{game.imposters.map(playerName).join(' og ')}</em></h1><div className="result-card"><small>{room.settings.mode === 'word' ? 'DET HEMMELIGE ORD' : 'DET RIGTIGE SPØRGSMÅL'}</small><strong>{wordCard?.word || questionCard?.real}</strong><div className="result-divider" />{room.players.map(player => <div className="result-votes" key={player.id}><strong>{player.name}</strong><span>{game.voteCounts[player.id] ?? 0} stemmer</span></div>)}</div>{isHost ? <button className="primary" onClick={() => void action('reset')}>Tilbage til lobbyen <span>→</span></button> : <p>Venter på værten…</p>}</>}
+    {error && <p className="error" role="alert">{error}</p>}
+    <button className="secondary" onClick={leave}>Forlad rummet</button>
+  </section>
 }
 
 createRoot(document.getElementById('root')!).render(<App />)
