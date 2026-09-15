@@ -1,6 +1,6 @@
 import { Redis } from '@upstash/redis'
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { questionCards, wordCards, type QuestionCard, type WordCard } from '../src/content'
+import { questionCards, wordCards, type QuestionCard, type WordCard } from '../src/content.js'
 
 // Persistent room models. Tokens never leave the player-specific API response.
 type GameSettings = { mode: 'word' | 'question'; imposterCount: 1 | 2; hintMode: 'always' | 'starter' | 'never'; contentSource: 'built-in' | 'mixed'; turnTimeSeconds: 0 | 15 | 30 | 45 | 60 }
