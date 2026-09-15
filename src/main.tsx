@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { questionCards, wordCards, type QuestionCard, type WordCard } from './content'
 import { loadQuestionCards, loadWordCards, nextCard, saveQuestionCards, saveWordCards } from './cards'
@@ -8,6 +8,14 @@ type Mode = 'word' | 'question'
 type Phase = 'setup' | 'handoff' | 'private' | 'discuss' | 'vote' | 'result'
 type ContentSource = 'built-in' | 'mixed' | 'custom'
 type HintMode = 'always' | 'starter' | 'never'
+type PlayLocation = 'choose' | 'local' | 'online'
+type OnlineView = 'menu' | 'create' | 'join' | 'lobby'
+type OnlineRoom = {
+  code: string
+  phase: 'lobby'
+  players: { id: string; name: string }[]
+}
+type RoomResponse = { room?: OnlineRoom; playerId?: string; isHost?: boolean; error?: string }
 type Round = {
   mode: Mode
   players: string[]
@@ -37,6 +45,15 @@ function randomIndexes(total: number, count: number) {
 }
 
 function App() {
+  const [playLocation, setPlayLocation] = useState<PlayLocation>('choose')
+  const [onlineView, setOnlineView] = useState<OnlineView>('menu')
+  const [onlineName, setOnlineName] = useState('')
+  const [onlineCode, setOnlineCode] = useState('')
+  const [onlineRoom, setOnlineRoom] = useState<OnlineRoom | null>(null)
+  const [onlinePlayerId, setOnlinePlayerId] = useState('')
+  const [onlineIsHost, setOnlineIsHost] = useState(false)
+  const [onlineBusy, setOnlineBusy] = useState(false)
+  const [copied, setCopied] = useState(false)
   const [mode, setMode] = useState<Mode>('word')
   const [phase, setPhase] = useState<Phase>('setup')
   const [players, setPlayers] = useState<string[]>([])
@@ -64,6 +81,70 @@ function App() {
   const wordCard = round?.mode === 'word' ? round.card as WordCard : null
   const questionCard = round?.mode === 'question' ? round.card as QuestionCard : null
   const allFound = round !== null && selected.length === round.imposters.length && selected.every(index => round.imposters.includes(index))
+
+  const onlineRoomCode = onlineRoom?.code
+  useEffect(() => {
+    if (!onlineRoomCode) return
+    const refreshRoom = async () => {
+      try {
+        const response = await fetch(`/api/rooms?code=${onlineRoomCode}`, { cache: 'no-store' })
+        const data = await response.json() as RoomResponse
+        if (response.ok && data.room) setOnlineRoom(data.room)
+      } catch {
+        // A kortvarig netværksfejl skal ikke smide spilleren ud af lobbyen.
+      }
+    }
+    const timer = window.setInterval(refreshRoom, 2000)
+    return () => window.clearInterval(timer)
+  }, [onlineRoomCode])
+
+  async function submitOnline(action: 'create' | 'join') {
+    const playerName = onlineName.trim().replace(/\s+/g, ' ')
+    const code = onlineCode.trim().toUpperCase()
+    if (!playerName) return setError('Skriv dit navn først.')
+    if (action === 'join' && !/^[A-Z2-9]{4}$/.test(code)) return setError('Rumkoden skal være på fire tegn.')
+
+    setOnlineBusy(true)
+    setError('')
+    try {
+      const response = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, playerName, ...(action === 'join' ? { code } : {}) }),
+      })
+      const data = await response.json() as RoomResponse
+      if (!response.ok || !data.room || !data.playerId) throw new Error(data.error || 'Kunne ikke forbinde til rummet.')
+      setOnlineRoom(data.room)
+      setOnlinePlayerId(data.playerId)
+      setOnlineIsHost(Boolean(data.isHost))
+      setOnlineView('lobby')
+    } catch (onlineError) {
+      setError(onlineError instanceof Error ? onlineError.message : 'Kunne ikke forbinde til rummet.')
+    } finally {
+      setOnlineBusy(false)
+    }
+  }
+
+  function leaveOnline() {
+    setOnlineRoom(null)
+    setOnlinePlayerId('')
+    setOnlineIsHost(false)
+    setOnlineView('menu')
+    setError('')
+  }
+
+  function goHome() {
+    if (phase !== 'setup') reset(false)
+    leaveOnline()
+    setPlayLocation('choose')
+  }
+
+  async function copyRoomCode() {
+    if (!onlineRoom) return
+    await navigator.clipboard.writeText(onlineRoom.code)
+    setCopied(true)
+    window.setTimeout(() => setCopied(false), 1800)
+  }
 
   function addPlayer() {
     const trimmed = name.trim().replace(/\s+/g, ' ')
@@ -171,11 +252,67 @@ function App() {
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><span className="brand-mark">?</span><span>HVEM ER <strong>IMPOSTER</strong></span></div>
-      {phase !== 'setup' && <button className="text-button" onClick={() => { if (window.confirm('Afslut denne runde og gå tilbage til opsætning?')) reset() }}>Afslut runde</button>}
+      {playLocation !== 'choose' && <button className="text-button" onClick={() => { if (phase === 'setup' || window.confirm('Afslut denne runde og gå tilbage?')) goHome() }}>{phase === 'setup' ? 'Tilbage' : 'Afslut runde'}</button>}
     </header>
 
     <main>
-      {phase === 'setup' && <>
+      {playLocation === 'choose' && <section className="entry-screen">
+        <section className="hero entry-hero">
+          <div className="eyebrow"><span className="live-dot" /> VÆLG HVORDAN I SPILLER</div>
+          <h1>Samme bluff.<br /><em>Jeres måde.</em></h1>
+          <p>Spil sammen på én telefon, eller opret et online-rum, hvor alle deltager fra deres egen enhed.</p>
+        </section>
+        <div className="location-grid">
+          <button className="location-card" onClick={() => setPlayLocation('local')}>
+            <span className="location-icon coral">▣</span>
+            <span className="location-copy"><strong>Spil lokalt</strong><small>Send én telefon rundt mellem alle spillere.</small></span>
+            <span className="mode-arrow">→</span>
+          </button>
+          <button className="location-card featured" onClick={() => setPlayLocation('online')}>
+            <span className="location-icon purple">◎</span>
+            <span className="location-copy"><strong>Spil online</strong><small>Opret eller deltag i et rum fra hver jeres telefon.</small></span>
+            <span className="online-pill">NY</span><span className="mode-arrow">→</span>
+          </button>
+        </div>
+      </section>}
+
+      {playLocation === 'online' && <section className="online-screen">
+        {onlineView !== 'lobby' && <>
+          <section className="hero online-hero">
+            <div className="eyebrow"><span className="live-dot" /> ONLINE MULTIPLAYER</div>
+            <h1>Spil fra <em>hver jeres skærm.</em></h1>
+            <p>En spiller opretter rummet. Resten deltager med den korte rumkode.</p>
+          </section>
+          {onlineView === 'menu' && <div className="location-grid compact">
+            <button className="location-card" onClick={() => { setOnlineView('create'); setError('') }}><span className="location-icon coral">＋</span><span className="location-copy"><strong>Opret et rum</strong><small>Du bliver vært og inviterer de andre.</small></span><span className="mode-arrow">→</span></button>
+            <button className="location-card" onClick={() => { setOnlineView('join'); setError('') }}><span className="location-icon purple">↗</span><span className="location-copy"><strong>Deltag i et rum</strong><small>Brug koden, som værten viser dig.</small></span><span className="mode-arrow">→</span></button>
+          </div>}
+          {(onlineView === 'create' || onlineView === 'join') && <section className="panel online-form-panel">
+            <div className="section-heading"><span className="step">{onlineView === 'create' ? '＋' : '↗'}</span><div><h2>{onlineView === 'create' ? 'Opret et rum' : 'Deltag i et rum'}</h2><p>{onlineView === 'create' ? 'Vælg det navn, de andre spillere kan se.' : 'Skriv dit navn og den firetegnskode, du har fået.'}</p></div></div>
+            <form className="online-form" onSubmit={event => { event.preventDefault(); void submitOnline(onlineView) }}>
+              <label>Dit navn<input value={onlineName} onChange={event => setOnlineName(event.target.value)} placeholder="F.eks. Emil" maxLength={24} autoComplete="nickname" /></label>
+              {onlineView === 'join' && <label>Rumkode<input className="room-code-input" value={onlineCode} onChange={event => setOnlineCode(event.target.value.toUpperCase().replace(/[^A-Z2-9]/g, '').slice(0, 4))} placeholder="AB12" maxLength={4} autoCapitalize="characters" /></label>}
+              {error && <p className="error" role="alert">{error}</p>}
+              <button className="primary" disabled={onlineBusy}>{onlineBusy ? 'Forbinder…' : onlineView === 'create' ? 'Opret rum' : 'Deltag'} <span>→</span></button>
+              <button className="secondary" type="button" onClick={() => { setOnlineView('menu'); setError('') }}>Tilbage</button>
+            </form>
+          </section>}
+        </>}
+        {onlineView === 'lobby' && onlineRoom && <section className="game-screen online-lobby">
+          <div className="eyebrow"><span className="live-dot" /> ONLINE LOBBY</div>
+          <h1>Rummet er <em>klar.</em></h1>
+          <p>Del koden med de andre spillere. Listen opdateres automatisk.</p>
+          <button className="room-code-card" onClick={() => void copyRoomCode()} aria-label="Kopiér rumkode"><small>RUMKODE</small><strong>{onlineRoom.code}</strong><span>{copied ? 'Kopieret!' : 'Tryk for at kopiere'}</span></button>
+          <div className="lobby-panel">
+            <div className="lobby-heading"><div><strong>Spillere</strong><small>{onlineRoom.players.length} / 20 i lobbyen</small></div><span className="connection-state"><i /> LIVE</span></div>
+            <div className="lobby-players">{onlineRoom.players.map(player => <div className="lobby-player" key={player.id}><span className="avatar">{player.name.charAt(0).toLocaleUpperCase('da')}</span><strong>{player.name}</strong>{player.id === onlinePlayerId && <small>DIG</small>}</div>)}</div>
+          </div>
+          {onlineIsHost ? <><button className="primary" disabled>Start spillet <span>→</span></button><p className="selection-count">Selve online-spilrunden bliver næste trin.</p></> : <p className="waiting-note"><span /> Venter på at værten starter spillet…</p>}
+          <button className="secondary" onClick={leaveOnline}>Forlad rummet</button>
+        </section>}
+      </section>}
+
+      {playLocation === 'local' && phase === 'setup' && <>
         <section className="hero">
           <div className="eyebrow"><span className="live-dot" /> SPIL SAMMEN · ÉN TELEFON</div>
           <h1>Kan du finde<br /><em>imposteren?</em></h1>
