@@ -991,28 +991,9 @@ textarea::placeholder {
 .lobby-player small + small {
   margin-left: -5px;
 }
-/* Active online round: timer, hints, answers and voting. */
-.timer-options {
-  flex-wrap: wrap;
-}
+/* Active online round: hints, answers and voting. */
 .online-game {
   max-width: 700px;
-}
-.timer-ring {
-  display: grid;
-  place-items: center;
-  width: 72px;
-  height: 72px;
-  margin: 0 auto 22px;
-  border: 5px solid #ff8b72;
-  border-radius: 50%;
-  font:
-    700 27px "Space Grotesk",
-    sans-serif;
-}
-.timer-ring.urgent {
-  color: #ff8b72;
-  animation: pulse 0.7s infinite;
 }
 .online-clues {
   display: grid;

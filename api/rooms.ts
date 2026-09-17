@@ -3,14 +3,14 @@ import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { questionCards, wordCards, type QuestionCard, type WordCard } from '../src/content.js'
 
 // Persistent room models. Tokens never leave the player-specific API response.
-type GameSettings = { mode: 'word' | 'question'; imposterCount: 1 | 2; hintMode: 'always' | 'starter' | 'never'; contentSource: 'built-in' | 'mixed'; turnTimeSeconds: 0 | 15 | 30 | 45 | 60 }
+type GameSettings = { mode: 'word' | 'question'; imposterCount: 1 | 2; hintMode: 'always' | 'starter' | 'never'; contentSource: 'built-in' | 'mixed' }
 type Player = { id: string; token: string; name: string; joinedAt: string; lastSeenAt: string }
-type Game = { imposters: string[]; starterId: string; card: WordCard | QuestionCard; readyIds: string[]; turnIndex: number; clues: Record<string, string>; answers: Record<string, string>; votes: Record<string, string>; deadline: number | null }
+type Game = { imposters: string[]; starterId: string; turnOrder: string[]; card: WordCard | QuestionCard; readyIds: string[]; turnIndex: number; clueRound: number; clues: Record<string, string[]>; answers: Record<string, string>; votes: Record<string, string> }
 type Room = { code: string; phase: 'lobby' | 'reveal' | 'turns' | 'answering' | 'discussion' | 'vote' | 'result'; createdAt: string; updatedAt: string; hostId: string; players: Player[]; settings: GameSettings; game?: Game }
 
 const ROOM_LIFETIME_SECONDS = 60 * 60 * 12
 const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-const DEFAULT_SETTINGS: GameSettings = { mode: 'word', imposterCount: 1, hintMode: 'always', contentSource: 'built-in', turnTimeSeconds: 30 }
+const DEFAULT_SETTINGS: GameSettings = { mode: 'word', imposterCount: 1, hintMode: 'always', contentSource: 'built-in' }
 
 // Single Vercel Function entry point for room reads and commands.
 export default async function handler(request: VercelRequest, response: VercelResponse) {
@@ -91,22 +91,22 @@ async function leaveRoom(body: Record<string, unknown>, response: VercelResponse
   const result = await mutateRoom(identity.code, room => {
     const player = authenticatedPlayer(room, identity)
     if (!player) return { error: 'Spilleren findes ikke i rummet.', status: 403 }
-    const currentTurnId = room.phase === 'turns' && room.game ? room.players[room.game.turnIndex]?.id : null
+    const currentTurnId = room.phase === 'turns' && room.game ? currentPlayerId(room.game) : null
     room.players = room.players.filter(item => item.id !== player.id)
     room.updatedAt = new Date().toISOString()
     if (room.players.length && room.hostId === player.id) room.hostId = room.players[0].id
     if (room.players.length < 6) room.settings.imposterCount = 1
     if (room.game) {
       room.game.imposters = room.game.imposters.filter(id => id !== player.id)
+      room.game.turnOrder = room.game.turnOrder.filter(id => id !== player.id)
       room.game.readyIds = room.game.readyIds.filter(id => id !== player.id)
       delete room.game.clues[player.id]; delete room.game.answers[player.id]; delete room.game.votes[player.id]
       for (const [voter, target] of Object.entries(room.game.votes)) if (target === player.id) delete room.game.votes[voter]
       if (room.players.length < 3) { room.phase = 'lobby'; delete room.game }
       else if (currentTurnId) {
-        const nextIndex = room.players.findIndex(item => item.id === currentTurnId)
+        const nextIndex = room.game.turnOrder.indexOf(currentTurnId)
         if (nextIndex >= 0) room.game.turnIndex = nextIndex
-        else if (room.game.turnIndex >= room.players.length) { room.phase = 'discussion'; room.game.deadline = null }
-        else setDeadline(room)
+        else if (room.game.turnIndex >= room.game.turnOrder.length) room.game.turnIndex = 0
       }
     }
     return { room, deleteRoom: room.players.length === 0 }
@@ -122,7 +122,6 @@ async function heartbeat(body: Record<string, unknown>, response: VercelResponse
     const player = authenticatedPlayer(room, identity)
     if (!player) return { error: 'Spilleren findes ikke i rummet.', status: 403 }
     player.lastSeenAt = new Date().toISOString()
-    advanceExpiredTurn(room)
     return { room, player }
   })
   if ('error' in result) return json(response, { error: result.error }, result.status)
@@ -131,13 +130,14 @@ async function heartbeat(body: Record<string, unknown>, response: VercelResponse
 
 async function updateSettings(body: Record<string, unknown>, response: VercelResponse) {
   const identity = readIdentity(body)
-  const settings = normalizeSettings(body.settings)
-  if (!identity || !settings) return json(response, { error: 'Ugyldige indstillinger.' }, 400)
+  const changes = normalizeSettingChanges(body.changes)
+  if (!identity || !changes) return json(response, { error: 'Ugyldige indstillinger.' }, 400)
   const result = await mutateRoom(identity.code, room => {
     const player = authenticatedPlayer(room, identity)
     if (!player) return { error: 'Spilleren findes ikke i rummet.', status: 403 }
     if (room.hostId !== player.id) return { error: 'Kun værten kan ændre indstillingerne.', status: 403 }
     if (room.phase !== 'lobby') return { error: 'Indstillingerne kan kun ændres i lobbyen.', status: 409 }
+    const settings = { ...room.settings, ...changes }
     if (settings.imposterCount === 2 && room.players.length < 6) return { error: 'I skal være mindst 6 spillere for at vælge 2 impostere.', status: 409 }
     room.settings = settings
     room.updatedAt = new Date().toISOString()
@@ -155,7 +155,8 @@ async function startGame(body: Record<string, unknown>, response: VercelResponse
     const order = shuffled(room.players.map(player => player.id))
     const imposters = order.slice(0, Math.min(room.settings.imposterCount, room.players.length < 6 ? 1 : 2))
     const cards = room.settings.mode === 'word' ? wordCards : questionCards
-    room.game = { imposters, starterId: order[randomIndex(order.length)], card: cards[randomIndex(cards.length)], readyIds: [], turnIndex: 0, clues: {}, answers: {}, votes: {}, deadline: null }
+    const turnOrder = shuffled(room.players.map(player => player.id))
+    room.game = { imposters, starterId: turnOrder[0], turnOrder, card: cards[randomIndex(cards.length)], readyIds: [], turnIndex: 0, clueRound: 0, clues: {}, answers: {}, votes: {} }
     room.phase = 'reveal'
     room.updatedAt = new Date().toISOString()
     return room
@@ -168,8 +169,7 @@ async function markReady(body: Record<string, unknown>, response: VercelResponse
     if (!room.game.readyIds.includes(player.id)) room.game.readyIds.push(player.id)
     if (room.game.readyIds.length === room.players.length) {
       room.phase = room.settings.mode === 'word' ? 'turns' : 'answering'
-      room.game.turnIndex = Math.max(0, room.players.findIndex(item => item.id === room.game?.starterId))
-      setDeadline(room)
+      room.game.turnIndex = 0
     }
     return room
   })
@@ -181,9 +181,10 @@ async function submitTurn(body: Record<string, unknown>, response: VercelRespons
   return authenticatedMutation(body, response, false, (room, player) => {
     if (!room.game) return { error: 'Spillet er ikke startet.', status: 409 }
     if (room.phase === 'turns') {
-      const current = room.players[room.game.turnIndex]
-      if (current?.id !== player.id) return { error: 'Det er ikke din tur.', status: 409 }
-      room.game.clues[player.id] = text.split(' ')[0]
+      if (currentPlayerId(room.game) !== player.id) return { error: 'Det er ikke din tur.', status: 409 }
+      const playerClues = room.game.clues[player.id] ?? []
+      playerClues[room.game.clueRound] = text.split(' ')[0]
+      room.game.clues[player.id] = playerClues
       advanceTurn(room)
     } else if (room.phase === 'answering') {
       room.game.answers[player.id] = text
@@ -195,7 +196,8 @@ async function submitTurn(body: Record<string, unknown>, response: VercelRespons
 
 async function advanceGame(body: Record<string, unknown>, response: VercelResponse) {
   return authenticatedMutation(body, response, true, room => {
-    if (room.phase !== 'discussion') return { error: 'Spillet er ikke i diskussionen.', status: 409 }
+    if (room.phase === 'turns' && room.game?.clueRound === 0) return { error: 'Gennemfør mindst én skriverunde først.', status: 409 }
+    if (room.phase !== 'turns' && room.phase !== 'discussion') return { error: 'Afstemningen kan ikke startes endnu.', status: 409 }
     room.phase = 'vote'
     return room
   })
@@ -233,10 +235,9 @@ async function authenticatedMutation(body: Record<string, unknown>, response: Ve
   return json(response, { room: publicRoom(result.room), game: playerGame(result.room, identity.playerId), isHost: result.room.hostId === identity.playerId })
 }
 
-// Turn-order and server-deadline helpers.
-function advanceExpiredTurn(room: Room) { if (room.phase === 'turns' && room.game?.deadline && Date.now() >= room.game.deadline) advanceTurn(room) }
-function advanceTurn(room: Room) { if (!room.game) return; room.game.turnIndex += 1; if (room.game.turnIndex >= room.players.length) { room.phase = 'discussion'; room.game.deadline = null } else setDeadline(room) }
-function setDeadline(room: Room) { if (room.game) room.game.deadline = room.settings.turnTimeSeconds ? Date.now() + room.settings.turnTimeSeconds * 1000 : null }
+// Complete turn cycles continue until the host opens voting.
+function currentPlayerId(game: Game) { return game.turnOrder[game.turnIndex] ?? null }
+function advanceTurn(room: Room) { if (!room.game) return; room.game.turnIndex += 1; if (room.game.turnIndex >= room.game.turnOrder.length) { room.game.turnIndex = 0; room.game.clueRound += 1 } }
 function shuffled<T>(values: T[]) { const copy = [...values]; for (let index = copy.length - 1; index > 0; index -= 1) { const other = randomIndex(index + 1); [copy[index], copy[other]] = [copy[other], copy[index]] } return copy }
 function randomIndex(max: number) { const value = new Uint32Array(1); crypto.getRandomValues(value); return value[0] % max }
 
@@ -255,7 +256,7 @@ async function mutateRoom<T extends { room: Room; deleteRoom?: boolean }>(code: 
   try {
     const room = await redis.get<Room>(roomKey(code))
     if (!room) return { error: 'Rummet findes ikke eller er udløbet.', status: 404 }
-    room.settings ??= DEFAULT_SETTINGS
+    migrateRoom(room)
     const result = mutation(room)
     if ('error' in result) return result
     if (result.deleteRoom) await redis.del(roomKey(code))
@@ -285,10 +286,10 @@ function playerGame(room: Room, playerId: string) {
     starterId: game.starterId,
     ready: game.readyIds.includes(playerId),
     readyCount: game.readyIds.length,
-    currentPlayerId: room.phase === 'turns' ? room.players[game.turnIndex]?.id ?? null : null,
-    deadline: game.deadline,
+    currentPlayerId: room.phase === 'turns' ? currentPlayerId(game) : null,
+    clueRound: game.clueRound,
     clues: game.clues,
-    submitted: Boolean(game.clues[playerId] || game.answers[playerId]),
+    submitted: room.settings.mode === 'question' ? Boolean(game.answers[playerId]) : Boolean(game.clues[playerId]?.[game.clueRound]),
     answers: room.phase === 'discussion' || room.phase === 'vote' || room.phase === 'result' ? game.answers : {},
     voted: Boolean(game.votes[playerId]),
     votesCast: Object.keys(game.votes).length,
@@ -301,11 +302,15 @@ function authenticatedPlayer(room: Room, identity: { playerId: string; playerTok
 function readIdentity(body: Record<string, unknown>) { const code = normalizeCode(body.code); const playerId = typeof body.playerId === 'string' ? body.playerId : ''; const playerToken = typeof body.playerToken === 'string' ? body.playerToken : ''; return code && playerId && playerToken ? { code, playerId, playerToken } : null }
 
 // Validate every value received from an untrusted browser client.
-function normalizeSettings(value: unknown): GameSettings | null {
+function normalizeSettingChanges(value: unknown): Partial<GameSettings> | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
-  const settings = value as Partial<GameSettings>
-  if (!['word', 'question'].includes(settings.mode ?? '') || (settings.imposterCount !== 1 && settings.imposterCount !== 2) || !['always', 'starter', 'never'].includes(settings.hintMode ?? '') || !['built-in', 'mixed'].includes(settings.contentSource ?? '') || ![0, 15, 30, 45, 60].includes(settings.turnTimeSeconds ?? -1)) return null
-  return settings as GameSettings
+  const changes = value as Partial<GameSettings>
+  if (changes.mode !== undefined && !['word', 'question'].includes(changes.mode)) return null
+  if (changes.imposterCount !== undefined && changes.imposterCount !== 1 && changes.imposterCount !== 2) return null
+  if (changes.hintMode !== undefined && !['always', 'starter', 'never'].includes(changes.hintMode)) return null
+  if (changes.contentSource !== undefined && !['built-in', 'mixed'].includes(changes.contentSource)) return null
+  if (!Object.keys(changes).length || Object.keys(changes).some(key => !['mode', 'imposterCount', 'hintMode', 'contentSource'].includes(key))) return null
+  return changes
 }
 
 function createPlayer(name: string, now: string): Player { return { id: crypto.randomUUID(), token: crypto.randomUUID(), name, joinedAt: now, lastSeenAt: now } }
@@ -314,6 +319,27 @@ function normalizeCode(value: unknown) { if (typeof value !== 'string') return '
 function normalizePlayerName(value: unknown) { if (typeof value !== 'string') return ''; const name = value.trim().replace(/\s+/g, ' '); return name.length >= 1 && name.length <= 24 ? name : '' }
 function readBody(value: unknown): Record<string, unknown> | null { try { const parsed: unknown = typeof value === 'string' ? JSON.parse(value) : value; return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null } catch { return null } }
 function roomKey(code: string) { return `room:${code}` }
+
+// Keep rooms created by older deployments playable after state-model changes.
+function migrateRoom(room: Room) {
+  room.settings = {
+    mode: room.settings?.mode ?? DEFAULT_SETTINGS.mode,
+    imposterCount: room.settings?.imposterCount ?? DEFAULT_SETTINGS.imposterCount,
+    hintMode: room.settings?.hintMode ?? DEFAULT_SETTINGS.hintMode,
+    contentSource: room.settings?.contentSource ?? DEFAULT_SETTINGS.contentSource,
+  }
+  if (!room.game) return
+  if (!Array.isArray(room.game.turnOrder)) {
+    const ids = room.players.map(player => player.id)
+    const starterIndex = Math.max(0, ids.indexOf(room.game.starterId))
+    room.game.turnOrder = [...ids.slice(starterIndex), ...ids.slice(0, starterIndex)]
+    room.game.turnIndex = 0
+  }
+  if (!Number.isInteger(room.game.clueRound)) room.game.clueRound = 0
+  for (const [playerId, clues] of Object.entries(room.game.clues)) {
+    if (typeof clues === 'string') room.game.clues[playerId] = [clues]
+  }
+}
 
 // Lazily initialize Redis so builds do not require runtime credentials.
 let redisClient: Redis | null = null
